@@ -1,5 +1,5 @@
 from exp.exp_basic import Exp_Basic
-from models import dual  # 修改：导入新的双分支模型
+from models import dual,redual,STAR,FusedTimeModel  # 修改：导入新的双分支模型
 from data_provider.data_factory import data_provider
 from utils.tools import EarlyStopping, adjust_learning_rate
 from utils.metrics import metric
@@ -17,6 +17,7 @@ import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
 from datetime import datetime
 import seaborn as sns
+from exp.learning_rate import (AdaptiveLossLRScheduler,CombinedLRScheduler,plot_lr_loss_history,)
 
 warnings.filterwarnings('ignore')
 
@@ -98,6 +99,7 @@ class Exp_Fused_Forecast(Exp_Basic):
         return total_loss, r2
 
     def train(self, setting):
+        """修改后的训练方法，集成自适应学习率调度器"""
         train_data, train_loader = self._get_data(flag='train')
         vali_data, vali_loader = self._get_data(flag='val')
         test_data, test_loader = self._get_data(flag='test')
@@ -113,26 +115,74 @@ class Exp_Fused_Forecast(Exp_Basic):
 
         # 设置早停patience为5，最大epoch为25
         early_stopping = EarlyStopping(patience=5, verbose=True)
-        max_epochs = 25
+        max_epochs = 20
 
         model_optim = self._select_optimizer()
         criterion = self._select_criterion()
 
-        scheduler = lr_scheduler.OneCycleLR(
-            optimizer=model_optim,
-            steps_per_epoch=train_steps,
-            pct_start=self.args.pct_start,
-            epochs=max_epochs,
-            max_lr=self.args.learning_rate
-        )
+        # ===== 新的学习率调度器设置 =====
+        if hasattr(self.args, 'lradj') and self.args.lradj == 'adaptive':
+            # 使用纯自适应调度器
+            scheduler = AdaptiveLossLRScheduler(
+                optimizer=model_optim,
+                patience=1,  # 3个epoch验证损失无改善就降低学习率
+                factor=0.5,  # 学习率减半
+                min_lr=1e-7,  # 最小学习率
+                verbose=True,
+                threshold=1e-4,  # 改善阈值（相对）
+                cooldown=2  # 调整后等待2个epoch再次检查
+            )
+            use_adaptive = True
 
-        # 记录训练历史
+        elif hasattr(self.args, 'lradj') and self.args.lradj == 'combined':
+            # 使用组合调度器（余弦退火 + 自适应）
+            scheduler = CombinedLRScheduler(
+                optimizer=model_optim,
+                T_max=max_epochs,
+                eta_min=1e-6,
+                adaptive_patience=1,
+                adaptive_factor=0.3,
+                min_lr=1e-8,
+                verbose=True
+            )
+            use_adaptive = True
+
+        elif hasattr(self.args, 'lradj') and self.args.lradj == 'plateau':
+            # 使用PyTorch内置的ReduceLROnPlateau
+            from torch.optim.lr_scheduler import ReduceLROnPlateau
+            scheduler = ReduceLROnPlateau(
+                optimizer=model_optim,
+                mode='min',
+                factor=0.5,
+                patience=1,
+                verbose=True,
+                threshold=1e-4,
+                min_lr=1e-7
+            )
+            use_adaptive = True
+
+        else:
+            # 保持原有的OneCycleLR或自定义调度器
+            if hasattr(self.args, 'lradj') and self.args.lradj == 'TST':
+                scheduler = lr_scheduler.OneCycleLR(
+                    optimizer=model_optim,
+                    steps_per_epoch=train_steps,
+                    pct_start=self.args.pct_start,
+                    epochs=max_epochs,
+                    max_lr=self.args.learning_rate
+                )
+            else:
+                scheduler = None
+            use_adaptive = False
+
+        # 记录训练历史（增加学习率记录）
         train_history = {
             'train_loss': [],
             'vali_loss': [],
             'vali_r2': [],
             'test_loss': [],
-            'test_r2': []
+            'test_r2': [],
+            'learning_rate': []  # 新增学习率记录
         }
 
         # 创建总的epoch进度条
@@ -167,13 +217,17 @@ class Exp_Fused_Forecast(Exp_Basic):
                 loss = criterion(outputs, batch_y)
                 train_loss.append(loss.item())
 
-                # 更新：batch进度条显示当前loss
-                batch_pbar.set_postfix({'Loss': f"{loss.item():.6f}"})
+                # 更新：batch进度条显示当前loss和学习率
+                current_lr = model_optim.param_groups[0]['lr']
+                batch_pbar.set_postfix({
+                    'Loss': f"{loss.item():.6f}",
+                    'LR': f"{current_lr:.2e}"
+                })
 
                 if (i + 1) % 100 == 0:
                     speed = (time.time() - time_now) / iter_count
                     left_time = speed * ((max_epochs - epoch) * train_steps - i)
-                    tqdm.write(f"\titers: {i + 1}, epoch: {epoch + 1} | loss: {loss.item():.7f}")
+                    tqdm.write(f"\titers: {i + 1}, epoch: {epoch + 1} | loss: {loss.item():.7f} | lr: {current_lr:.2e}")
                     tqdm.write(f'\tspeed: {speed:.4f}s/iter; left time: {left_time:.4f}s')
                     iter_count = 0
                     time_now = time.time()
@@ -181,7 +235,8 @@ class Exp_Fused_Forecast(Exp_Basic):
                 loss.backward()
                 model_optim.step()
 
-                if self.args.lradj == 'TST':
+                # 对于OneCycleLR，在每个batch后调用
+                if hasattr(self.args, 'lradj') and self.args.lradj == 'TST' and scheduler is not None:
                     scheduler.step()
 
             batch_pbar.close()
@@ -191,27 +246,48 @@ class Exp_Fused_Forecast(Exp_Basic):
             vali_loss, vali_r2 = self.vali(vali_data, vali_loader, criterion)
             test_loss, test_r2 = self.vali(test_data, test_loader, criterion)
 
+            # 记录当前学习率
+            current_lr = model_optim.param_groups[0]['lr']
+
             # 记录历史
             train_history['train_loss'].append(train_loss)
             train_history['vali_loss'].append(vali_loss)
             train_history['vali_r2'].append(vali_r2)
             train_history['test_loss'].append(test_loss)
             train_history['test_r2'].append(test_r2)
+            train_history['learning_rate'].append(current_lr)
+
+            # ===== 学习率调度 =====
+            if use_adaptive:
+                if hasattr(self.args, 'lradj') and self.args.lradj in ['adaptive', 'combined']:
+                    scheduler.step(vali_loss, epoch)
+                elif hasattr(self.args, 'lradj') and self.args.lradj == 'plateau':
+                    scheduler.step(vali_loss)
+            else:
+                # 使用原有的自定义学习率调整
+                if hasattr(self.args, 'lradj') and self.args.lradj != 'TST':
+                    adjust_learning_rate(model_optim, epoch + 1, self.args)
+
+            # 检查学习率是否发生变化
+            new_lr = model_optim.param_groups[0]['lr']
+            if abs(new_lr - current_lr) > 1e-10:  # 学习率发生变化
+                tqdm.write(f"Learning rate changed from {current_lr:.2e} to {new_lr:.2e}")
 
             # 使用tqdm.write输出结果，避免与进度条冲突
             tqdm.write(f"Epoch: {epoch + 1} cost time: {epoch_cost_time:.2f}s")
             tqdm.write(
                 f"Epoch: {epoch + 1}, Steps: {train_steps} | Train Loss: {train_loss:.7f} Vali Loss: {vali_loss:.7f} Test Loss: {test_loss:.7f}")
-            tqdm.write(f"Vali R²: {vali_r2:.4f} Test R²: {test_r2:.4f}")
+            tqdm.write(f"Vali R²: {vali_r2:.4f} Test R²: {test_r2:.4f} | LR: {new_lr:.2e}")
 
             # 更新：epoch进度条显示当前指标
             epoch_pbar.set_postfix({
                 'Train_Loss': f"{train_loss:.6f}",
                 'Vali_R2': f"{vali_r2:.4f}",
-                'Test_R2': f"{test_r2:.4f}"
+                'Test_R2': f"{test_r2:.4f}",
+                'LR': f"{new_lr:.2e}"
             })
 
-            adjust_learning_rate(model_optim, epoch + 1, self.args)
+            # 早停检查
             early_stopping(vali_loss, self.model, path)
             if early_stopping.early_stop:
                 tqdm.write("Early stopping triggered!")
@@ -220,7 +296,7 @@ class Exp_Fused_Forecast(Exp_Basic):
 
         epoch_pbar.close()
 
-        # 保存训练历史
+        # 保存训练历史（包含学习率历史）
         history_file = os.path.join(path, f'training_history_{self.experiment_timestamp}.json')
         train_history_serializable = {}
         for key, value in train_history.items():
@@ -230,6 +306,22 @@ class Exp_Fused_Forecast(Exp_Basic):
         with open(history_file, 'w') as f:
             json.dump(train_history_serializable, f, indent=2)
 
+        # 如果使用自适应调度器，保存学习率调度历史和可视化
+        if use_adaptive and isinstance(scheduler, (AdaptiveLossLRScheduler, CombinedLRScheduler)):
+            try:
+                # 保存调度器状态
+                scheduler_state_file = os.path.join(path, f'scheduler_state_{self.experiment_timestamp}.json')
+                if hasattr(scheduler, 'state_dict'):
+                    with open(scheduler_state_file, 'w') as f:
+                        json.dump(scheduler.state_dict(), f, indent=2)
+
+                # 生成学习率和损失的可视化图表
+                lr_plot_path = os.path.join(path, f'lr_loss_history_{self.experiment_timestamp}.png')
+                plot_lr_loss_history(scheduler, lr_plot_path)
+
+            except Exception as e:
+                tqdm.write(f"Warning: Could not save scheduler visualization: {e}")
+
         best_model_path = path + '/' + 'checkpoint.pth'
         self.model.load_state_dict(torch.load(best_model_path))
 
@@ -237,6 +329,15 @@ class Exp_Fused_Forecast(Exp_Basic):
         tqdm.write("Computing final training metrics...")
         final_train_loss, final_train_r2 = self.train_step_metrics(train_loader, criterion)
         tqdm.write(f"Final Training R²: {final_train_r2:.6f}")
+
+        # 输出学习率调度总结
+        if use_adaptive:
+            final_lr = model_optim.param_groups[0]['lr']
+            initial_lr = self.args.learning_rate
+            tqdm.write(f"Learning rate summary: Initial: {initial_lr:.2e}, Final: {final_lr:.2e}")
+            if hasattr(scheduler, 'lr_history') and scheduler.lr_history:
+                min_lr = min(scheduler.lr_history)
+                tqdm.write(f"Minimum learning rate reached: {min_lr:.2e}")
 
     def train_step_metrics(self, train_loader, criterion):
         """计算训练集上的R²指标（可选调用）"""
