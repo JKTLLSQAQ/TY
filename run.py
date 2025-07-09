@@ -1,6 +1,6 @@
 import argparse
 import torch
-from exp.exp_fused_forecast import Exp_Fused_Forecast
+from exp.Train import  Exp_Adapted_Progressive_Battery, setup_progressive_args
 import random
 import numpy as np
 import os
@@ -19,11 +19,13 @@ def main():
     torch.backends.cudnn.deterministic = True
 
     parser = argparse.ArgumentParser(description='DualBranch FusedTimeModel')
+
+    args = setup_progressive_args(args)
     # 基础配置
     parser.add_argument('--task_name', type=str, default='long_term_forecast')
     parser.add_argument('--is_training', type=int, default=1)
     parser.add_argument('--model_id', type=str, default='dual_branch_test')
-    parser.add_argument('--model', type=str, default='dual',
+    parser.add_argument('--model', type=str, default='DD',
                         choices=['DualBranchModel', 'FusedTimeModel', 'dual'],
                         help='模型选择：DualBranchModel(双分支时频域), FusedTimeModel(原融合模型), dual(双分支简称)')
     ##小波变换
@@ -40,7 +42,7 @@ def main():
     # 数据配置
     parser.add_argument('--data', type=str, default='Custom')
     parser.add_argument('--root_path', type=str, default='./dataset/')
-    parser.add_argument('--data_path', type=str, default='1.csv')
+    parser.add_argument('--data_path', type=str, default='CS2.csv')
     parser.add_argument('--features', type=str, default='MS')
     parser.add_argument('--target', type=str, default='Target')
     parser.add_argument('--freq', type=str, default='h')
@@ -48,12 +50,12 @@ def main():
     parser.add_argument('--seasonal_patterns', type=str, default=None, help='seasonal patterns for M4 dataset')
 
     # 预测任务配置
-    parser.add_argument('--seq_len', type=int, default=96)
-    parser.add_argument('--label_len', type=int, default=72)
-    parser.add_argument('--pred_len', type=int, default=48)
+    parser.add_argument('--seq_len', type=int, default=15)
+    parser.add_argument('--label_len', type=int, default=15)
+    parser.add_argument('--pred_len', type=int, default=1)
 
     # 模型配置
-    parser.add_argument('--enc_in', type=int, default=14)
+    parser.add_argument('--enc_in', type=int, default=8)
     parser.add_argument('--c_out', type=int, default=1)
     parser.add_argument('--d_model', type=int, default=256, help='模型维度，必须能被注意力头数整除')
     parser.add_argument('--d_ff', type=int, default=1024)
@@ -83,6 +85,21 @@ def main():
                         help='是否启用频域学习分支')
     parser.add_argument('--fourier_modes', type=int, default=32,
                         help='傅里叶变换保留的模式数')
+
+    # ============ 精简版Enhanced STAR配置 ============
+    parser.add_argument('--use_deformable_conv', type=bool, default=True,
+                        help='是否使用可变形卷积检测容量回升')
+    parser.add_argument('--use_adaptive_loss', type=bool, default=True,
+                        help='是否使用Barron自适应损失函数')
+
+    # ============ 融合权重配置 ============
+    parser.add_argument('--trend_weight', type=float, default=0.4,
+                        help='趋势分量初始权重')
+    parser.add_argument('--seasonal_weight', type=float, default=0.2,
+                        help='季节性分量初始权重')
+    parser.add_argument('--recovery_weight', type=float, default=0.4,
+                        help='容量回升分量初始权重')
+
 
     # ============ 扩散模块配置 ============
     parser.add_argument('--diffusion_steps', type=int, default=100,
@@ -172,15 +189,6 @@ def main():
         elif order_value > 10:
             print(f"⚠️  警告：{order_attr} > 10，可能导致过拟合，建议降低")
 
-    # 实验信息输出
-    current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    print('=' * 100)
-    print(f'🚀 FusedTimeModel 实验开始')
-    print(f'⏰ 开始时间: {current_time}')
-    print(f'📊 数据集: {args.data_path}')
-    print(f'🤖 模型: {args.model}')
-    print(f'📏 序列长度: {args.seq_len}, 预测长度: {args.pred_len}')
-    print(f'🎯 特征类型: {args.features}, 目标变量: {args.target}')
 
     # 扩散配置信息
     print(f'\n🌀 扩散模块配置:')
@@ -229,7 +237,7 @@ def main():
             else:
                 setting = f'{base_setting}{diffusion_suffix}'
 
-            exp = Exp_Fused_Forecast(args)
+            exp = Exp_Adapted_Progressive_Battery(args)
             print(f'\n🏃 开始训练: {setting}')
             print('>' * 80)
             exp.train(setting)
